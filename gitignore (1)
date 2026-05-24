@@ -1,0 +1,56 @@
+# ============================================================
+# .gitignore — Logistics Fabric Pipeline
+# NEVER commit secrets, credentials, or real client data
+# ============================================================
+
+# Environment / secrets
+.env
+.env.*
+*.env
+secrets/
+credentials/
+
+# Azure / Fabric credentials
+*.publishsettings
+azureauth.json
+local.settings.json
+fabric_token.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Databricks / Fabric Notebooks
+.databricks/
+*.dbc
+.trident/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data files — no real client data
+*.csv
+*.parquet
+*.json.gz
+data/
+sample_data/
+raw_exports/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Fabric workspace export — may contain real workspace IDs
+workspace_export/
+*.pbix

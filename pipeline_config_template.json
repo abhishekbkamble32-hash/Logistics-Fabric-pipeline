@@ -1,0 +1,179 @@
+{
+    "name": "pl_logistics_master_ingestion",
+    "description": "Microsoft Fabric end-to-end pipeline for Logistics Domain Data Platform. Orchestrates all 5 source ingestions, triggers Silver transformation notebooks, and loads Gold layer. No ADF — fully native Microsoft Fabric.",
+    "properties": {
+        "activities": [
+            {
+                "name": "Ingest_Orders_API",
+                "type": "Copy",
+                "description": "Orders Management System via REST API — every 4 hours. Watermark on order_updated_at. Frequency: 4-hourly because operations needed at-risk orders before SLA breach, not 24 hours later.",
+                "typeProperties": {
+                    "source": {
+                        "type": "RestSource",
+                        "httpRequestTimeout": "00:10:00",
+                        "requestInterval": "00:00:01",
+                        "additionalHeaders": {
+                            "X-API-Key": "@variables('oms_api_key')"
+                        },
+                        "paginationRules": {
+                            "QueryParameters.page": "RANGE:1:1000:1"
+                        }
+                    },
+                    "sink": {
+                        "type": "ParquetSink",
+                        "storeSettings": {
+                            "type": "LakehouseWriteSettings"
+                        }
+                    }
+                },
+                "inputs": [
+                    {
+                        "referenceName": "ds_orders_rest_api",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "watermark_value": "@variables('orders_last_watermark')"
+                        }
+                    }
+                ],
+                "outputs": [
+                    {
+                        "referenceName": "ds_lakehouse_bronze",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "folder": "orders",
+                            "run_id": "@pipeline().RunId"
+                        }
+                    }
+                ]
+            },
+            {
+                "name": "Ingest_Shipment_FlatFiles",
+                "type": "Copy",
+                "description": "Shipment tracking flat files — daily drops",
+                "typeProperties": {
+                    "source": {
+                        "type": "DelimitedTextSource",
+                        "storeSettings": {
+                            "type": "LakehouseReadSettings",
+                            "recursive": false
+                        }
+                    },
+                    "sink": {
+                        "type": "ParquetSink"
+                    }
+                }
+            },
+            {
+                "name": "Ingest_Warehouse_Inventory",
+                "type": "Copy",
+                "description": "Warehouse inventory from Azure SQL — daily",
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": "SELECT * FROM warehouse_inventory WHERE updated_at > '@{variables('inventory_last_watermark')}'"
+                    },
+                    "sink": {
+                        "type": "ParquetSink"
+                    }
+                }
+            },
+            {
+                "name": "Ingest_Carrier_Master",
+                "type": "Copy",
+                "description": "Carrier master from Azure SQL — weekly full load. Under 1,000 rows, rarely changes. Full load used — incremental adds complexity with no benefit.",
+                "typeProperties": {
+                    "source": {
+                        "type": "AzureSqlSource",
+                        "sqlReaderQuery": "SELECT * FROM carrier_master"
+                    },
+                    "sink": {
+                        "type": "ParquetSink"
+                    }
+                }
+            },
+            {
+                "name": "Ingest_Master_Data_CSV",
+                "type": "Copy",
+                "description": "Product and customer master data CSVs — weekly",
+                "typeProperties": {
+                    "source": {
+                        "type": "DelimitedTextSource"
+                    },
+                    "sink": {
+                        "type": "ParquetSink"
+                    }
+                }
+            },
+            {
+                "name": "Bronze_Audit_All_Sources",
+                "type": "FabricNotebook",
+                "description": "Add audit columns to all Bronze tables. Parameterized — one notebook for all 5 sources.",
+                "dependsOn": [
+                    { "activity": "Ingest_Orders_API",          "dependencyConditions": ["Succeeded"] },
+                    { "activity": "Ingest_Shipment_FlatFiles",  "dependencyConditions": ["Succeeded"] },
+                    { "activity": "Ingest_Warehouse_Inventory", "dependencyConditions": ["Succeeded"] },
+                    { "activity": "Ingest_Carrier_Master",      "dependencyConditions": ["Succeeded"] },
+                    { "activity": "Ingest_Master_Data_CSV",     "dependencyConditions": ["Succeeded"] }
+                ],
+                "typeProperties": {
+                    "notebookId": "<notebook-id-bronze-audit>",
+                    "parameters": {
+                        "source_system": { "value": "all", "type": "string" },
+                        "pipeline_run_id": { "value": "@pipeline().RunId", "type": "string" }
+                    }
+                }
+            },
+            {
+                "name": "Silver_Orders_Cleanse",
+                "type": "FabricNotebook",
+                "dependsOn": [{ "activity": "Bronze_Audit_All_Sources", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "notebookId": "<notebook-id-silver-orders>",
+                    "parameters": {
+                        "load_date": { "value": "@formatDateTime(utcnow(), 'yyyy-MM-dd')", "type": "string" }
+                    }
+                }
+            },
+            {
+                "name": "Silver_Shipments_Parse",
+                "type": "FabricNotebook",
+                "dependsOn": [{ "activity": "Silver_Orders_Cleanse", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "notebookId": "<notebook-id-silver-shipments>",
+                    "parameters": {
+                        "load_date": { "value": "@formatDateTime(utcnow(), 'yyyy-MM-dd')", "type": "string" }
+                    }
+                }
+            },
+            {
+                "name": "Silver_SCD_Merge",
+                "type": "FabricNotebook",
+                "description": "SCD Type 2 MERGE on dim_customer and dim_product. SCD Type 1 on Carrier Master.",
+                "dependsOn": [{ "activity": "Silver_Shipments_Parse", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "notebookId": "<notebook-id-scd-merge>",
+                    "parameters": {
+                        "load_date": { "value": "@formatDateTime(utcnow(), 'yyyy-MM-dd')", "type": "string" }
+                    }
+                }
+            },
+            {
+                "name": "Gold_Facts_KPI_Load",
+                "type": "FabricNotebook",
+                "description": "Build fact_shipments, fact_orders, fact_inventory + 4 KPI tables into Fabric Warehouse.",
+                "dependsOn": [{ "activity": "Silver_SCD_Merge", "dependencyConditions": ["Succeeded"] }],
+                "typeProperties": {
+                    "notebookId": "<notebook-id-gold-load>",
+                    "parameters": {
+                        "load_date": { "value": "@formatDateTime(utcnow(), 'yyyy-MM-dd')", "type": "string" }
+                    }
+                }
+            }
+        ],
+        "annotations": ["logistics", "fabric-native", "medallion", "end-to-end"],
+        "schedule": {
+            "orders_ingestion": "every 4 hours",
+            "full_pipeline":    "daily at 06:00 UTC"
+        }
+    }
+}
